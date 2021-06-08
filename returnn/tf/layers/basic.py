@@ -2639,6 +2639,8 @@ class MergeDimsLayer(_ConcatInputLayer):
         # Time got merged with feature or batch.
         data.time_dim_axis = None
     data.feature_dim_axis = new_feature_dim_axis
+    if not data.sparse and data.feature_dim_axis is not None:
+      data.dim = data.batch_shape[data.feature_dim_axis]
     # Set size_placeholder, here for now without merging any axes. Merged axes are then updated in __init__.
     data.size_placeholder = {}
     for old_axis, dyn_size in sorted(input_data.size_placeholder.items()):
@@ -3243,36 +3245,72 @@ class RepeatLayer(_ConcatInputLayer):
 
   def __init__(self, repetitions, axis="T", **kwargs):
     """
-    :param LayerBase repetitions: number of repetitions for each sequence and position in target axis, [B,T] or [T,B]
+    :param LayerBase|int repetitions:
+      number of repetitions for each sequence and position in target axis.
+      Can be [B,T] or [T,B] or some subset of that shape
     :param str axis: (dynamic) axis for repetition (currently only time axis is supported)
     """
     from returnn.tf.util.data import DimensionTag
     super(RepeatLayer, self).__init__(**kwargs)
     self.repetitions = repetitions
-    repetitions_data = self.repetitions.output
-    input_data = self.input_data
-    assert self.input_data and self.input_data.have_batch_axis()
-    input_data = input_data.copy_as_batch_major()
-    original_axis = input_data.get_axis_from_description(axis, allow_int=False)
-    input_data = input_data.copy_move_axis(original_axis, 1)
-    repetitions_data = repetitions_data.copy_as_batch_major()
+    if isinstance(self.repetitions, int):
+      repetitions_data = Data.from_tensor(tf.constant(self.repetitions))
+    else:
+      assert isinstance(self.repetitions, LayerBase)
+      repetitions_data = self.repetitions.output
+    input_axis = self.input_data.get_axis_from_description(axis, allow_int=False)
     assert repetitions_data.dtype in ["int32", "int64"]
-    assert repetitions_data.have_batch_axis() and repetitions_data.batch_ndim == 2, (
-      "RepeatLayer only accepts repetitions of the shape (B, None|S) or (None|S, B)")
-    assert input_data.shape[0] == repetitions_data.shape[0], (
-      "Axis mismatch between input (%i) and repetitions (%i)" %
-      (input_data.shape[0], repetitions_data.shape[0]))
+    if repetitions_data.ndim == 0:  # no T dim: add a (un)broadcasted one.
+      axis_dim_tag = self.input_data.get_dim_tag(input_axis)
+      repetitions_data = repetitions_data.copy_add_dim_by_tag(axis_dim_tag, unbroadcast=True)
+    repetitions_axis = repetitions_data.get_axis_from_description(axis, allow_int=False)
+    assert repetitions_data.ndim == 1, "Repetitions %r must only have at most one non-batch axis" % repetitions
+    assert repetitions_data.batch_shape[repetitions_axis] == self.input_data.batch_shape[input_axis], (
+      "Axis mismatch between input (%i) and repetitions (%i)" % (
+        self.input_data.batch_shape[input_axis], repetitions_data.batch_shape[repetitions_axis]))
+
+    assert self.output.have_batch_axis() == (self.input_data.have_batch_axis() or repetitions_data.have_batch_axis())
+
+    def copy_placeholder_with_batch_axis(data, other_batch):
+      """
+      Adds a batch dim by unbroadcasting if our output also has a batch dim,
+      otherwise just expands the dims.
+
+      :param Data data:
+      :param BatchInfo|None other_batch: use this batch info if we should add some
+      :rtype: tf.Tensor
+      :return: the placeholder, with shape [B, T, ...], maybe with added batch dim.
+      """
+      if self.output.have_batch_axis():
+        if data.have_batch_axis():
+          data = data.copy_as_batch_major()
+        else:
+          data = data.copy_add_batch_dim(batch_dim_axis=0, batch=other_batch)  # will unbroadcast
+        original_axis = data.get_axis_from_description(axis, allow_int=False)
+        data = data.copy_move_axis(original_axis, 1)
+        return data.placeholder  # [B, T, ...]
+      else:
+        assert not self.output.have_batch_axis()
+        original_axis = data.get_axis_from_description(axis, allow_int=False)
+        data = data.copy_move_axis(original_axis, 0)
+        return tf.expand_dims(data.placeholder, 0)  # [B=1, T, ...]
+
+    input_placeholder = copy_placeholder_with_batch_axis(
+      self.input_data, other_batch=repetitions_data.batch)  # [B, T, ... ]
+    repetitions_placeholder = copy_placeholder_with_batch_axis(
+      repetitions_data, other_batch=self.input_data.batch)  # [B, T]
+
     # pad the target axis
-    paddings = [(0, 1) if i == 1 else (0, 0) for i in range(input_data.batch_ndim)]
-    padded_data = tf.pad(input_data.placeholder, paddings)  # [B, T+1, ...]
+    paddings = [(0, 1) if i == 1 else (0, 0) for i in range(self.input_data.ndim + 1)]
+    padded_data = tf.pad(input_placeholder, paddings)  # [B, T+1, ...]
     # those are the sequence lengths after expansion
-    target_seq_len = tf.reduce_sum(repetitions_data.placeholder, axis=1)  # [B], the new size_placeholder for 'T'
+    target_seq_len = tf.reduce_sum(repetitions_placeholder, axis=1)  # [B], the new size_placeholder for 'T'
     # maximum sequence length after expansion
     max_duration = tf.reduce_max(target_seq_len)  # [] == T'
     # the new padding is the difference of the maximum to the new target
     target_padding_steps = tf.expand_dims(max_duration - target_seq_len, 1)  # [B, 1]
     # add the repetitions for the artificial padding position
-    target_repetitions = tf.concat([repetitions_data.placeholder, target_padding_steps], axis=1)  # [B, T+1]
+    target_repetitions = tf.concat([repetitions_placeholder, target_padding_steps], axis=1)  # [B, T+1]
     # flatten batch and time
     shape = tf_util.get_shape(padded_data)
     flat_shape = [shape[0] * shape[1]] + shape[2:]
@@ -3281,12 +3319,11 @@ class RepeatLayer(_ConcatInputLayer):
     # run the repetition
     repeated_data = tf.repeat(reshaped_data, reshaped_repetitions, axis=0)  # [B * T', ...]
     # unflatten the output
-    target_shape = [shape[0], max_duration] + shape[2:]
-    self.output.placeholder = tf.reshape(repeated_data, target_shape)  # [B, T', ...]
-    # copy (optional) additional size placeholders
-    self.output.size_placeholder = {k: v for k, v in input_data.size_placeholder.items() if k != 0}
-    # set the size_placeholder of the target axis
-    self.output.size_placeholder[0] = target_seq_len
+    target_shape = ([shape[0]] if self.output.have_batch_axis() else []) + [max_duration] + shape[2:]
+    self.output.placeholder = tf.reshape(repeated_data, target_shape)  # [B, T', ...] or [T', ...]
+    # set size placeholders
+    output_axis = self.output.get_axis_from_description(axis)
+    self.output.size_placeholder[self.output.get_batch_axis_excluding_batch(output_axis)] = target_seq_len
     tag = DimensionTag(
       description="repeated:%s" % self.get_absolute_name(),
       kind=DimensionTag.Types.Spatial)
@@ -3297,7 +3334,8 @@ class RepeatLayer(_ConcatInputLayer):
     :rtype: list[LayerBase]
     """
     deps = super(RepeatLayer, self).get_dep_layers()
-    deps.append(self.repetitions)
+    if isinstance(self.repetitions, LayerBase):
+      deps.append(self.repetitions)
     return deps
 
   @classmethod
@@ -3308,21 +3346,28 @@ class RepeatLayer(_ConcatInputLayer):
     :param get_layer:
     """
     super(RepeatLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
-    d["repetitions"] = get_layer(d["repetitions"])
+    if isinstance(d["repetitions"], str):
+      d["repetitions"] = get_layer(d["repetitions"])
 
   @classmethod
   def get_out_data_from_opts(cls, name, axis, repetitions, sources=(), **kwargs):
     """
     :param str name:
     :param str axis:
-    :param LayerBase repetitions:
+    :param LayerBase|int repetitions:
     :param list[LayerBase] sources:
     :rtype: Data
     """
     data = get_concat_sources_data_template(sources, name="%s_output" % name)
-    data = data.copy_as_batch_major()
-    axis = data.get_axis_from_description(axis, allow_int=False)
-    data = data.copy_move_axis(axis, data.get_batch_axis(0))
+    if data.have_batch_axis():
+      data = data.copy_as_batch_major()
+    elif isinstance(repetitions, LayerBase) and repetitions.output.have_batch_axis():
+      data = data.copy_add_batch_dim(batch_dim_axis=0, batch=repetitions.output.batch)
+    original_axis = data.get_axis_from_description(axis, allow_int=False)
+    data = data.copy_move_axis(original_axis, data.get_batch_axis(0))
+    data.shape = (None,) + data.shape[1:]
+    if data.feature_dim_axis == data.get_batch_axis(0):
+      data.dim = None
     return data
 
 
@@ -3702,12 +3747,15 @@ class ReinterpretDataLayer(_ConcatInputLayer):
           out.dim = None
         else:
           out.dim = out.batch_shape[out.feature_dim_axis]
+    old_dim = out.dim
     if set_sparse_dim is not NotSpecified:
       assert set_sparse_dim is None or isinstance(set_sparse_dim, int)
       out.dim = set_sparse_dim
     if increase_sparse_dim:
       assert out.sparse
       out.dim += increase_sparse_dim
+    if old_dim != out.dim:
+      out.vocab = None
     return out
 
 
@@ -4204,7 +4252,7 @@ class TransposedConvLayer(_ConcatInputLayer):
     padding = padding.lower()
     if strides is None:
       strides = filter_size
-    if not isinstance(remove_padding, (tuple, int)):
+    if not isinstance(remove_padding, (list, tuple)):
       remove_padding = [remove_padding] * len(spatial_axes)
     if not isinstance(output_padding, (list, tuple)):
       output_padding = [output_padding] * len(spatial_axes)
@@ -5817,7 +5865,8 @@ class CombineLayer(LayerBase):
                eval=None, eval_locals=None, eval_for_output_loss=False,
                **kwargs):
     """
-    :param str kind: currently accepted values are `average`, `add`, `sub`, `mul`, 'truediv', or `eval`
+    :param str kind:
+      currently accepted values are `average`, `add`, `sub`, `mul`, `truediv`, `logical_and`, `logical_or`, or `eval`
     :param list[LayerBase] sources:
     :param str|None activation: if provided, activation function to apply, e.g. "tanh" or "relu"
     :param bool with_bias: if given, will add a trainable bias tensor
@@ -5826,7 +5875,7 @@ class CombineLayer(LayerBase):
     :param bool eval_for_output_loss: will do the same eval on layer.output_loss
     """
     super(CombineLayer, self).__init__(sources=sources, **kwargs)
-    assert kind in ["average", "add", "sub", "mul", "truediv", "eval"], (
+    assert kind in ["average", "add", "sub", "mul", "truediv", "logical_and", "logical_or", "eval"], (
       "%s: Invalid `kind` %r for this layer." % (self, kind))
     op = self._get_op(kind=kind, eval_str=eval, eval_locals=eval_locals)
     x = op(sources)
@@ -5938,6 +5987,20 @@ class CombineLayer(LayerBase):
     x = self._op_kind_add(sources)
     x /= len(sources)
     return x
+
+  def _op_kind_logical_and(self, sources):
+    """
+    :param list[LayerBase] sources:
+    :rtype: tf.Tensor
+    """
+    return self._op_dense_fn(sources, tf.logical_and)
+
+  def _op_kind_logical_or(self, sources):
+    """
+    :param list[LayerBase] sources:
+    :rtype: tf.Tensor
+    """
+    return self._op_dense_fn(sources, tf.logical_or)
 
   def _op_kind_eval(self, sources, eval_str, eval_locals=None):
     """
@@ -6420,6 +6483,102 @@ class CondLayer(LayerBase):
       if layer:
         layers.append(layer)
     return layers
+
+
+class SearchSortedLayer(LayerBase):
+  """
+  Basically wraps :func:`tf.searchsorted`.
+
+  Takes a tensor `sorted_sequence` that is sorted along one axis, and a tensor `values`.
+  Will compute an output tensor with the same axes as `values`,
+  where each entry is the index of the value within the sorted sequence.
+  All (batch) axes of `sorted_sequence` except for the axis it is sorted along must be present in `values`.
+  """
+  layer_class = "search_sorted"
+  recurrent = True  # do not shuffle the sorted_sequence
+
+  def __init__(self, sorted_sequence, values, axis="T", side="left", **kwargs):
+    """
+    :param LayerBase sorted_sequence:
+    :param LayerBase values: search values
+    :param str axis: the axis along which `sorted_sequence` is sorted
+    :param str side: "left" or "right".
+      When one of the `values` exactly matches an element of the `sorted_sequence`,
+      whether to choose the lower or higher index.
+    """
+    super(SearchSortedLayer, self).__init__(**kwargs)
+    self.sorted_sequence = sorted_sequence  # e.g. [B,T]
+    self.values = values  # e.g. [B,F]
+    sorted_axis = sorted_sequence.output.get_axis_from_description(axis)  # = T
+    side = side.lower()
+    assert side in {"left", "right"}
+
+    sorted_data = sorted_sequence.output  # e.g. [B,T]
+    values_data = values.output  # e.g. [B,F]
+    sorted_batch_axes = [ax for ax in range(sorted_data.batch_ndim) if ax != sorted_axis]  # = sorted B
+    sorted_to_values_batch_axes = values_data.find_matching_dim_map(
+      other=sorted_data, other_axes=sorted_batch_axes)  # sorted B -> values B
+    values_batch_axes = [
+      sorted_to_values_batch_axes[sorted_batch_ax] for sorted_batch_ax in sorted_batch_axes]  # = values B
+    values_non_batch_axes = [ax for ax in range(values_data.batch_ndim) if ax not in values_batch_axes]  # = F
+    assert len(values_non_batch_axes) == 1, 'not implemented'
+    # move batch axes to front and align them between sorted_data and values
+    transposed_sorted_data = sorted_data.copy_transpose(perm=sorted_batch_axes + [sorted_axis])  # [B,T]
+    transposed_values_data = values_data.copy_transpose(perm=values_batch_axes + values_non_batch_axes)  # [B,F]
+    x = transposed_sorted_data.placeholder  # [B,T]
+    if transposed_sorted_data.is_axis_dynamic(axis=-1):
+      from returnn.tf.util.basic import where_bc, sequence_mask
+      seq_mask = transposed_sorted_data.get_sequence_mask_broadcast(axis=-1)
+      x = where_bc(seq_mask, x, x.dtype.max)  # note: this is not correct if values contains x.dtype.max
+    self.output.placeholder = tf.searchsorted(
+      sorted_sequence=x, values=transposed_values_data.placeholder, side=side,
+      out_type=self.output.dtype)
+
+  def get_dep_layers(self):
+    """
+    :rtype: list[LayerBase]
+    """
+    return super(SearchSortedLayer, self).get_dep_layers() + [self.sorted_sequence, self.values]
+
+  @classmethod
+  def transform_config_dict(cls, d, network, get_layer):
+    """
+    :param dict[str] d: will modify inplace
+    :param returnn.tf.network.TFNetwork network:
+    :param ((str) -> LayerBase) get_layer: function to get or construct another layer
+    """
+    d.setdefault("from", [])
+    super(SearchSortedLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
+    d["sorted_sequence"] = get_layer(d["sorted_sequence"])
+    d["values"] = get_layer(d["values"])
+
+  @classmethod
+  def get_out_data_from_opts(cls, sorted_sequence, values, axis, name, network, **kwargs):
+    """
+    :param LayerBase sorted_sequence:
+    :param LayerBase values: search values
+    :param str axis: the axis along which `sorted_sequence` is sorted
+    :param str name:
+    :param returnn.tf.network.TFNetwork network:
+    :rtype: Data
+    """
+    sorted_data = sorted_sequence.output  # e.g. [B,T]
+    values_data = values.output  # e.g. [B,F]
+    sorted_axis = sorted_data.get_axis_from_description(axis)  # = T
+    sorted_batch_axes = [ax for ax in range(sorted_data.batch_ndim) if ax != sorted_axis]  # = sorted B
+    sorted_to_values_batch_axes = values_data.find_matching_dim_map(
+      other=sorted_data, other_axes=sorted_batch_axes)  # sorted B -> values B
+    values_batch_axes = [
+      sorted_to_values_batch_axes[sorted_batch_ax] for sorted_batch_ax in sorted_batch_axes]  # = values B
+    values_non_batch_axes = [ax for ax in range(values_data.batch_ndim) if ax not in values_batch_axes]  # = F
+    if len(values_non_batch_axes) != 1:
+      raise NotImplementedError(
+        "%r %s: need exactly one axis in values %r that does not match any in sorted_sequence %r, but found: %r" % (
+          cls, name, values_data, sorted_data, values_non_batch_axes))
+    # move all batch axes to front, non batch axes to back
+    output_data = values_data.copy("%s_output" % name).copy_transpose(perm=values_batch_axes + values_non_batch_axes)
+    output_data.dtype = "int32"
+    return output_data
 
 
 class SubnetworkLayer(LayerBase):

@@ -18,6 +18,12 @@ import returnn.tf.util.basic as tf_util
 from returnn.tf.util.basic import Data, DimensionTag, reuse_name_scope, VariableAssigner
 
 
+class DataNotFound(Exception):
+  """
+  When accessing non-existing ExternData data key
+  """
+
+
 class ExternData(object):
   """
   This holds `Data` instances for every data-key of external data from the dataset,
@@ -203,7 +209,7 @@ class ExternData(object):
       config_extern_data = "<unknown>"
       if self._config and self._config.has("extern_data"):
         config_extern_data = self._config.opt_typed_value("extern_data")
-      raise KeyError(
+      raise DataNotFound(
         "ExternData: unknown key %r. available keys: %s. config: %s" % (
           name, list(self.data.keys()), config_extern_data))
 
@@ -3571,6 +3577,8 @@ class CustomCheckpointLoader:
       "lstm_cell/weights": "lstm_cell/kernel",
       "lstm_cell/bias": "rnn/lstm_cell/bias",
       "lstm_cell/kernel": "rnn/lstm_cell/weights",
+      "rnn/lstm_cell/bias": "lstm_cell/bias",
+      "rnn/lstm_cell/kernel": "lstm_cell/kernel",
       "cudnn/params_canonical/rnn/multi_rnn_cell/cell_0/cudnn_compatible_lstm_cell/bias": "lstm_fused_cell/bias",
       "cudnn/params_canonical/rnn/multi_rnn_cell/cell_0/cudnn_compatible_lstm_cell/kernel": "lstm_fused_cell/kernel",
     }

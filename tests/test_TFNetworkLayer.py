@@ -1665,6 +1665,49 @@ def test_SwitchLayer_template_const_from():
   assert switch.dim == 2
 
 
+def test_SearchSortedLayer():
+  n_batch, n_time, n_in, n_out = 2, 10, 3, 5
+  random = numpy.random.RandomState(seed=1)
+  with make_scope() as session:
+    net = TFNetwork(extern_data=ExternData())
+    sorted_layer = InternalLayer(
+      name="sorted_sequence", network=net,
+      out_type={"shape": (None, n_in)})  # [B,T,F]
+    sorted = numpy.sort(random.uniform(0.0, 10.0, size=(n_batch, n_time, n_in)), axis=1)
+    sorted_lens = [10, 7]
+    sorted_layer.output.placeholder = tf.constant(sorted, dtype="float32")
+    sorted_layer.output.size_placeholder = {0: tf.constant(sorted_lens, dtype="int32")}  # [B]
+    values_layer = InternalLayer(
+      name="values", network=net,
+      out_type={"shape": (n_in, n_out), "time_dim_axis": None, "feature_dim_axis": 1})  # [B,F,F']
+    values = random.uniform(0.0, 10.0, size=(n_batch, n_in, n_out))
+    values_layer.output.placeholder = tf.constant(values, dtype="float32")
+
+    for side in ["left", "right"]:
+      print("Testing side=%r" % side)
+      opts = {
+        "network": net, "name": 'search_sorted_test', "sources": [], "sorted_sequence": sorted_layer,
+        "values": values_layer, "axis": "T", "side": side}
+      out_data = SearchSortedLayer.get_out_data_from_opts(**opts)
+      out_data.sanity_check(ignore_placeholder=True)
+      search_layer = SearchSortedLayer(output=out_data, **opts)  # should be [B,F]
+      out_data = search_layer.output
+      out_data.sanity_check()
+      print(search_layer.output)
+
+      output = session.run(search_layer.output.placeholder, feed_dict=make_feed_dict(net.extern_data))
+      assert output.dtype == "int32"
+      assert out_data.batch_shape == (None, n_in, n_out)
+      assert out_data.batch_dim_axis == 0
+      assert out_data.time_dim_axis is None
+      assert out_data.feature_dim_axis == 1
+      for b, t_max in enumerate(sorted_lens):
+        for f in range(n_in):
+          expected = numpy.searchsorted(a=sorted[b, :t_max, f], v=values[b, f, :], side=side)
+          actual = output[b, f, :]
+          numpy.testing.assert_equal(expected, actual)
+
+
 def test_CondLayer_subnetwork_train():
   n_batch, n_time, n_in, n_out = 3, 7, 11, 13
   config = Config({
@@ -1812,7 +1855,9 @@ def _run_repeat_layer(session, net, input_data_layer):
   repeat_layer = RepeatLayer(output=out_data, **opts)
   print(repeat_layer.output)
 
-  output, size_placeholder = session.run([repeat_layer.output.placeholder, repeat_layer.output.size_placeholder])
+  output, size_placeholder = session.run(
+    [repeat_layer.output.placeholder, repeat_layer.output.size_placeholder],
+    feed_dict=make_feed_dict(net.extern_data, n_batch=2))
   assert numpy.all(numpy.equal(size_placeholder[0], numpy.asarray([19, 11])))
   assert numpy.all(numpy.equal(output.shape, numpy.asarray([2, 19, 5])))
   # the 6 last positions of the second sequence need to be padded with zeros
@@ -1854,6 +1899,44 @@ def test_RepeatLayerBFT():
     input_data_layer.output.placeholder = tf_compat.v1.random_uniform((2, 5, 10))  # [B, F, T]
 
     _run_repeat_layer(session, net, input_data_layer)
+
+
+def test_RepeatLayerTF():
+  with make_scope() as session:
+    # need to provide extern_data here to provide batch info
+    net = TFNetwork(extern_data=ExternData(data={"data": {"dim": 2, "sparse": True}}), train_flag=True)
+    input_data_layer = InternalLayer(
+      name="src", network=net,
+      out_type={'shape': (None, 5), 'dim': 5, 'batch_dim_axis': None, 'time_dim_axis': 0})
+    input_data_layer.output.size_placeholder = {0: tf.constant([10])}  # []
+    input_data_layer.output.placeholder = tf_compat.v1.random_uniform((10, 5))  # [T, F]
+
+    _run_repeat_layer(session, net, input_data_layer)
+
+
+def test_RepeatLayer_int_repetitions():
+  with make_scope() as session:
+    n_out = 5
+    config = Config({
+      "debug_print_layer_output_template": True,
+      "extern_data": {
+        "data": {"dim": n_out},
+      }})
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict({
+      "output": {"class": "repeat", "repetitions": 3, "axis": "F", "from": ["data"]}
+    })
+    session.run(tf_compat.v1.global_variables_initializer())
+    out = net.layers["output"].output
+    n_batch = 3
+    max_seq_len = 10
+    feed = make_feed_dict(net.extern_data.data.values(), n_batch=n_batch, n_time=max_seq_len, same_time=True)
+    v = session.run(out.placeholder, feed_dict=feed)
+    input_data = feed[net.extern_data.data["data"].placeholder]
+
+    assert out.batch_dim_axis == 0
+    ref = numpy.swapaxes(numpy.repeat(input_data, 3, axis=-1), -1, out.feature_dim_axis)
+    numpy.testing.assert_allclose(ref, v, rtol=1e-5)
 
 
 def test_TileLayer():
